@@ -36,7 +36,7 @@ defaults = {
     CONF_PORT: ipyialarmmk.iAlarmMkInterface.IALARMMK_P2P_DEFAULT_PORT,
     CONF_USERNAME: "<CABxxxxxx>",
     CONF_PASSWORD: "<password>",
-    CONF_SCAN_INTERVAL: 60,
+    CONF_SCAN_INTERVAL: 5,
 }
 
 STEP_USER_DATA_SCHEMA = vol.Schema(

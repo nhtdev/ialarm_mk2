@@ -101,7 +101,7 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if entry.version < 2:
         data = dict(entry.data)
-        data.setdefault(CONF_SCAN_INTERVAL, 60)
+        data.setdefault(CONF_SCAN_INTERVAL, 5)
         ret: bool = hass.config_entries.async_update_entry(
             entry,
             data=data,
