@@ -264,6 +264,20 @@ class iAlarmMk2Coordinator(DataUpdateCoordinator):
                         self.num_read_ko = 0
                     self.hub.ialarmmk.ialarmmkClient.login()
                     _LOGGER.debug("Login ok.")
+                    # Poll alarm arm/disarm status: some panels (e.g. Orion IP2)
+                    # keep the push TCP keepalive alive but never send Alarm
+                    # events for remote/keypad arming. GetByWay only covers zones.
+                    alarm_status = self.hub.ialarmmk.ialarmmkClient.GetAlarmStatus()
+                    dev_status = alarm_status.get("DevStatus")
+                    if dev_status is not None:
+                        dev_status = int(dev_status)
+                        self.hub.ialarmmk.status = dev_status
+                        return_data.alarm_data.state = dev_status
+                        _LOGGER.debug(
+                            "Polled alarm status: %s(%s)",
+                            self.hub.ialarmmk.status_dict.get(dev_status),
+                            dev_status,
+                        )
                     status = self.hub.ialarmmk.ialarmmkClient.GetByWay()
                     _LOGGER.debug("Retrieve last sensors status.")
                     _LOGGER.debug("Status: %s", status)
