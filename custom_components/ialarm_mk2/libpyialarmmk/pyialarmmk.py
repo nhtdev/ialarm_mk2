@@ -94,77 +94,90 @@ class iAlarmMkClient:
             return False
         return True
 
-    def login(self):
-        self._print("Login method called.")
-        """Controlla se il socket è inizializzato e valido."""
-        if self.sock is None or self.sock.fileno() == -1:
-            self._print("Invalid or uninitialized socket, creating a new socket.")
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 60)
+    def login(self, force: bool = False):
+        """Ensure an authenticated TCP session with the panel.
 
-        # Controllo se il socket è già connesso
-        self._print("Checking if the socket is already connected.")
-        if not self.is_socket_connected():
-            self._print(
-                "Socket not connected, setting timeout and attempting to connect."
-            )
-            self.sock.settimeout(self.timeout)
-            try:
-                self._print("Attempting to connect to the server.")
-                self.sock.connect((self.host, self.port))
-                self._print("Connection successful, proceeding with login to server.")
+        Reuses an existing healthy session unless ``force`` is set. Always
+        starts from a clean socket when (re)authenticating so a half-open TCP
+        connection cannot skip login forever.
+        """
+        self._print(f"Login method called (force={force}).")
 
-                # Preparazione dei dati di login
-                cmd = OD()
-                cmd["Id"] = STR(self.uid)
-                cmd["Pwd"] = PWD(self.pwd)
-                cmd["Type"] = "TYP,ANDROID|0"
-                self.token = uuid.uuid4()
-                cmd["Token"] = STR(str(self.token))
-                cmd["Action"] = "TYP,IN|0"
-                cmd["PemNum"] = "STR,5|26"
-                cmd["DevVersion"] = None
-                cmd["DevType"] = None
-                cmd["Err"] = None
-                xpath = "/Root/Pair/Client"
+        if (
+            not force
+            and self.sock is not None
+            and self.token is not None
+            and self.is_socket_connected()
+        ):
+            self._print("Already logged in, reusing socket.")
+            return
 
-                # Invio dei dati al server
-                self.client = self._(xpath, cmd)
+        # Half-open / no-token sockets must not be reused: close first.
+        self.close_socket()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        self.sock.settimeout(self.timeout)
 
-                # Controllo degli errori nella risposta del server
-                if self.client["Err"]:
-                    self._print(
-                        f"Error during login to the server: {self.client['Err']}, token used is {self.token}"
-                    )
-                    self.close_socket()
-                    raise ClientError("Login error")
-                self._print(f"Login ok, token used is {self.token}")
+        try:
+            self._print("Attempting to connect to the server.")
+            self.sock.connect((self.host, self.port))
+            self._print("Connection successful, proceeding with login to server.")
 
-            except socket.timeout as e:
-                self._print(f"Connection timeout: {e}", e)
+            cmd = OD()
+            cmd["Id"] = STR(self.uid)
+            cmd["Pwd"] = PWD(self.pwd)
+            cmd["Type"] = "TYP,ANDROID|0"
+            self.token = uuid.uuid4()
+            cmd["Token"] = STR(str(self.token))
+            cmd["Action"] = "TYP,IN|0"
+            cmd["PemNum"] = "STR,5|26"
+            cmd["DevVersion"] = None
+            cmd["DevType"] = None
+            cmd["Err"] = None
+            xpath = "/Root/Pair/Client"
+
+            self.client = self._(xpath, cmd)
+
+            if self.client["Err"]:
+                self._print(
+                    f"Error during login to the server: {self.client['Err']}, token used is {self.token}"
+                )
                 self.close_socket()
-                raise ConnectionError("Connection error: timeout")
+                raise ClientError("Login error")
+            self._print(f"Login ok, token used is {self.token}")
 
-            except ConnectionRefusedError as e:
-                self._print(f"Connection refused by the server: {e}", e)
-                self.close_socket()
-                raise ConnectionError("Connection error: connection refused")
+        except socket.timeout as e:
+            self._print(f"Connection timeout: {e}", e)
+            self.close_socket()
+            raise ConnectionError("Connection error: timeout") from e
 
-            except socket.error as e:
-                self._print(f"Network error: {e}", e)
-                self.close_socket()
-                raise ConnectionError("Connection error: network error")
+        except ConnectionRefusedError as e:
+            self._print(f"Connection refused by the server: {e}", e)
+            self.close_socket()
+            raise ConnectionError("Connection error: connection refused") from e
 
-            except Exception as e:
-                self._print(f"Unexpected error during login: {e}", e)
-                self.close_socket()
-                raise ClientError("Unexpected error during login")
+        except socket.error as e:
+            self._print(f"Network error: {e}", e)
+            self.close_socket()
+            raise ConnectionError("Connection error: network error") from e
+
+        except (ConnectionError, ClientError):
+            self.close_socket()
+            raise
+
+        except Exception as e:
+            self._print(f"Unexpected error during login: {e}", e)
+            self.close_socket()
+            raise ClientError("Unexpected error during login") from e
 
     def close_socket(self):
-        """Funzione ausiliaria per chiudere il socket in modo sicuro."""
+        """Chiude il socket in modo sicuro e azzera sempre lo stato locale."""
         if self.sock:
             try:
                 self.sock.shutdown(socket.SHUT_RDWR)
+            except Exception as e:
+                self._print(f"Error shutting down socket: {e}")
+            try:
                 self.sock.close()
             except Exception as e:
                 self._print(f"Error closing socket: {e}")
@@ -172,16 +185,13 @@ class iAlarmMkClient:
                 self.sock = None
                 self._print(f"Closed socket with token: {self.token}")
                 self.token = None
+        else:
+            self.token = None
 
     def logout(self):
+        """Chiude la sessione; non deve mai lasciare un socket semi-chiuso."""
         self._print("Logout method called.")
-        if self.sock is None:
-            return
-        self.sock.shutdown(socket.SHUT_RDWR)
-        self.sock.close()
-        self.sock = None
-        self._print(f"Logout socket with token: {self.token}")
-        self.token = None
+        self.close_socket()
 
     def GetAlarmStatus(self):
         cmd = OD()

@@ -77,6 +77,9 @@ class iAlarmMk2Coordinator(DataUpdateCoordinator):
 
         self.num_read_ok: int = 0
         self.num_read_ko: int = 0
+        # Consecutive failed update cycles → exponential backoff before next poll
+        self._fail_streak: int = 0
+        self._next_retry_ts: float = 0.0
 
     async def _async_setup(self):
         _LOGGER.info("Setup data updater...")
@@ -215,21 +218,47 @@ class iAlarmMk2Coordinator(DataUpdateCoordinator):
         _LOGGER.debug("return_data: %s", return_data)
         self.async_set_updated_data(return_data)
 
+    def _backoff_seconds(self) -> int:
+        """Seconds to wait after consecutive failures (30 → 60 → 120)."""
+        if self._fail_streak <= 0:
+            return 0
+        return min(120, 30 * (2 ** min(self._fail_streak - 1, 2)))
+
     async def _async_update_data(self) -> CoordinatorData:
         """Fetch data from iAlarm-MK 2."""
         _LOGGER.info("Fetching data...")
 
-        if not self.last_update_success:
-            _LOGGER.warning("Last update was not successful, waiting 5 seconds.")
-            await asyncio.sleep(10)
+        now = time.time()
+        if self._next_retry_ts > now:
+            wait = self._next_retry_ts - now
+            _LOGGER.warning(
+                "Previous poll failed (streak=%s), backing off %.0fs before retry.",
+                self._fail_streak,
+                wait,
+            )
+            await asyncio.sleep(wait)
 
         try:
-            async with timeout(30):
-                return await self.hass.async_add_executor_job(self._fetch_device_data)
-
-            # await self.async_update_data()
+            # Allow one slow reconnect + panel pause without cancelling mid-flight.
+            async with timeout(60):
+                data = await self.hass.async_add_executor_job(self._fetch_device_data)
+            self._fail_streak = 0
+            self._next_retry_ts = 0.0
+            return data
         except Exception as error:
-            _LOGGER.exception("Error during fetch data.")
+            self._fail_streak += 1
+            backoff = self._backoff_seconds()
+            self._next_retry_ts = time.time() + backoff
+            _LOGGER.exception(
+                "Error during fetch data (streak=%s, next backoff=%ss).",
+                self._fail_streak,
+                backoff,
+            )
+            # Ensure the panel session is released even if the worker aborted early.
+            try:
+                self.hub.ialarmmk.ialarmmkClient.logout()
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                _LOGGER.debug("Logout after fetch failure raised", exc_info=True)
             raise UpdateFailed(error) from error
 
     def _fetch_device_data(self) -> CoordinatorData:
@@ -238,6 +267,7 @@ class iAlarmMk2Coordinator(DataUpdateCoordinator):
         _LOGGER.debug("Coordinator data: %s", self.data)
 
         return_data = copy.deepcopy(self.data)
+        log = ""
 
         try:
             return_data.alarm_data.last_keeplive_ts = (
@@ -253,7 +283,7 @@ class iAlarmMk2Coordinator(DataUpdateCoordinator):
 
             tz = ZoneInfo(self.hass.config.time_zone)
             attempts = 0
-            max_attempts = 3
+            max_attempts = 2
 
             while attempts < max_attempts:
                 try:
@@ -262,7 +292,8 @@ class iAlarmMk2Coordinator(DataUpdateCoordinator):
                         self.hub.ialarmmk.ialarmmkClient.logout()
                         self.num_read_ok = 0
                         self.num_read_ko = 0
-                    self.hub.ialarmmk.ialarmmkClient.login()
+                    # First try reuses a healthy session; retries force a new TCP login.
+                    self.hub.ialarmmk.ialarmmkClient.login(force=attempts > 0)
                     _LOGGER.debug("Login ok.")
                     # Poll alarm arm/disarm status: some panels (e.g. Orion IP2)
                     # keep the push TCP keepalive alive but never send Alarm
@@ -283,7 +314,6 @@ class iAlarmMk2Coordinator(DataUpdateCoordinator):
                     _LOGGER.debug("Status: %s", status)
                     self.num_read_ok += 1
 
-                    # Inizializza un messaggio di log e lo stato dei sensori
                     log = ""
                     for _idx, sensor in enumerate(return_data.sensors_data):
                         sensor: SensorData
@@ -292,7 +322,7 @@ class iAlarmMk2Coordinator(DataUpdateCoordinator):
                         sensor.last_fetch_time = datetime.now(tz)
 
                         log += f"\n- {sensor.zone_name}, state:{state}"
-                    break  # Se il blocco riesce, esci dal ciclo
+                    break
                 except Exception as e:
                     self.num_read_ko += 1
                     _LOGGER.exception("Error during fetch data.")
@@ -302,14 +332,15 @@ class iAlarmMk2Coordinator(DataUpdateCoordinator):
                     if attempts >= max_attempts:
                         _LOGGER.error("Failed after %d attempts", max_attempts)
                         raise UpdateFailed(e) from e
+                    # Give the panel time to free the TCP session slot.
+                    retry_wait = 15
                     _LOGGER.info(
-                        "Retrying... Attempt %d of %d in 5 seconds.",
+                        "Retrying... Attempt %d of %d in %d seconds.",
                         attempts + 1,
                         max_attempts,
+                        retry_wait,
                     )
-                    _LOGGER.debug("Waiting 5 second before next attempt.")
-                    time.sleep(5)
-                    _LOGGER.debug("Finished waiting, retrying now.")
+                    time.sleep(retry_wait)
                 finally:
                     _LOGGER.debug(
                         "Numbers of update ok: %s, ko: %s",
@@ -319,6 +350,10 @@ class iAlarmMk2Coordinator(DataUpdateCoordinator):
 
         except ConnectionError as e:
             _LOGGER.error("Error fetching data: %s", e)
+            try:
+                self.hub.ialarmmk.ialarmmkClient.logout()
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("Logout after ConnectionError raised", exc_info=True)
             raise UpdateFailed("Connection error") from e
 
         _LOGGER.debug(log)
